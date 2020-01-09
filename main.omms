@@ -1,0 +1,212 @@
+module main;
+
+PARENTAL_PIN_PROMT_SCREEN = 12;
+MG_ERROR_SCREEN           = 21;
+INSTANT_UPGRADE_SCREEN    = 23;
+TUNING_FAILED_SCREEN      = 41;
+REC_FAIL_SCREEN           = 58;
+DVR_FAIL_SCREEN_FIRST     = 81;
+DVR_FAIL_SCREEN_LAST      = 84;
+
+ERROR_REASON              = 28;
+APP_LAUNCH_REASON         = 39;
+AVN_SERVER_ERROR_REASON   = 180; // start of AVN server errors
+REC_NO_EPG_FAIL_REASON    = 200;
+REC_NO_SPACE_FAIL_REASON  = 201;
+
+BLACK_SCREEN_NOT_AUTHORIZED = 0; // synthetic reason
+BLACK_SCREEN_PARENTAL_PIN   = 1; // synthetic reason
+BLACK_SCREEN_TUNING_FAILED  = 2; // synthetic reason
+
+AVN_APPLICATION  = 5; // id of avn client application in dc event
+
+SEND_DELTA_TIME = 60; // time delta between sending
+
+// event types
+REGISTRATION_EVENT    = 1;
+NOEPG_EVENT           = 2;
+NOAVN_EVENT           = 3;
+NODVR_EVENT           = 4;
+REC_FAIL_EVENT        = 5;
+BLACK_SCREEN_EVENT    = 6;
+SDV_ERROR_EVENT       = 7;
+EPG_ERROR_POPUP_EVENT = 8;
+REBOOT_EVENT          = 9;
+ECHO_EVENT            = 10;
+LAST_EVENT            = 11;
+
+eventsInfo = [last_time] * LAST_EVENT;
+
+start()
+{
+    echo("v 1.9");
+    if (_docsisDownstreamFrequencyTuned == -1 && _docsisUpstreamFrequencyTuned == -1) {
+      echo("[W] Not a docsis environment, unloading");
+      eventsInfo.last_time[LAST_EVENT] := 0; // bounds check error -> unload module
+    }
+    register("dc:AppLaunch(int screen, int startTime, int timestampPartMsec, int reason, int channel)", AppLaunch);
+    register("dc:AppSessionComplete(int app, int appEndTime, int timestampPartMsec, int sessionId, int reason, int clientSessionId)", AppSessionComplete);
+    register("dc:EpgDataError(int date,int type,int error)", EpgDataError);
+    register("dc:BlackScreen(int reason)", BlackScreen);
+    register("dc:SdvError(int reason)", SdvError);
+    register("dc:MgOverlay(int startTime, int timestampPartMsec, int screen, int sessionId, int reason)", MgOverlay);
+    register("c", Console);
+
+    eventsInfo.last_time[REGISTRATION_EVENT] :=  _currentTime;
+    mkPersistentNs();
+    reportInt(REGISTRATION_EVENT);
+    reportInt(eventsInfo.last_time[REGISTRATION_EVENT]);
+    reportInt(_hubId);
+    reportInt(_nodeId);
+    reportStr(_uiFlashVersion);
+    reportStr(_uiRomVersion);
+    reportStr(_uiBuildNum);
+    
+    SendReboots();
+}
+
+
+Console(p) {
+    if (sEnds(p, 0, "echo")) // "module is active" signal
+        SendAlertCommon(ECHO_EVENT); 
+}
+
+
+SendAlertCommon(event_id)
+{
+    alertTime = _currentTime;
+    if ((alertTime - eventsInfo.last_time[event_id]) >= SEND_DELTA_TIME)
+    {
+        reportInt(event_id);
+        reportInt(alertTime);
+        eventsInfo.last_time[event_id] := alertTime;
+        return true;
+    }
+    echo("event "_ i2s(event_id) _" not sent: too often");
+    return false;
+}
+
+
+SendBlackScreen(screen, reason)
+{
+    black_screen_reason = 
+        screen == -1 ? reason :
+        screen == TUNING_FAILED_SCREEN && reason == APP_LAUNCH_REASON ?      BLACK_SCREEN_TUNING_FAILED :
+        screen == INSTANT_UPGRADE_SCREEN && reason == APP_LAUNCH_REASON ?    BLACK_SCREEN_NOT_AUTHORIZED :
+        screen == PARENTAL_PIN_PROMT_SCREEN && reason == APP_LAUNCH_REASON ? BLACK_SCREEN_PARENTAL_PIN :
+        -1; 
+
+    if (black_screen_reason == -1)
+        return false;
+    if (SendAlertCommon(BLACK_SCREEN_EVENT))
+        reportInt(black_screen_reason);
+    return true;
+}
+
+SendReboots()
+{
+    reboots = _getLastReboots(20);
+    rcount = count(reboots);
+    if (rcount == 0)
+        return;
+    reportInt(REBOOT_EVENT);
+    reportInt(rcount);
+    for (i = 0; i < rcount; i++)
+    {
+        reportInt(reboots.id[i]);
+        reportInt(reboots.reason[i]);
+        reportInt(reboots.subreason[i]);
+        reportInt(reboots.offTime[i]);
+        reportInt(reboots.onTime[i]);
+    }
+}
+
+AppLaunch(params)
+{
+    screen = intArg();
+    start_time = intArg();
+    timestampPartMsec = intArg();
+    reason = intArg();
+    channel = intArg();
+
+    if (SendBlackScreen(screen, reason))
+        return;
+
+    if ((reason == REC_NO_SPACE_FAIL_REASON && screen == REC_FAIL_SCREEN) ||
+        (reason == ERROR_REASON && screen >= DVR_FAIL_SCREEN_FIRST && screen <= DVR_FAIL_SCREEN_LAST))
+    {
+        if (SendAlertCommon(NODVR_EVENT))
+            reportInt(screen);
+        return;
+    }
+
+    if (screen == REC_FAIL_SCREEN && reason == REC_NO_EPG_FAIL_REASON)
+    {
+        if (SendAlertCommon(REC_FAIL_EVENT))
+            reportInt(channel);
+        return;
+    }
+    echo("AppLaunch event ignored");
+}
+
+
+AppSessionComplete(params)
+{
+    app = intArg();
+    end_time = intArg();
+    timestampPartMsec = intArg();
+    session_id = intArg();
+    reason = intArg();
+    clientSessionId = intArg();
+
+    if (app == AVN_APPLICATION && reason >= AVN_SERVER_ERROR_REASON &&
+        SendAlertCommon(NOAVN_EVENT))
+    {
+        reportInt(_avnServerIp);
+        reportInt(_avnServerPort);
+        reportInt(reason - AVN_SERVER_ERROR_REASON); // error
+    }
+}
+
+
+BlackScreen(params)
+{
+    SendBlackScreen(-1, intArg());
+}
+
+
+SdvError(params)
+{
+    if (SendAlertCommon(SDV_ERROR_EVENT))
+        reportInt(intArg());
+}
+
+
+EpgDataError(params)
+{
+    if (SendAlertCommon(NOEPG_EVENT))
+    {
+        fileDate = intArg();
+        srcType = intArg();
+        reason = intArg();
+        reportInt(srcType);
+        reportInt(fileDate);
+        reportInt(reason);
+    }
+}
+
+
+MgOverlay(params)
+{
+    startTime = intArg();
+    timestampPartMsec = intArg();
+    screen = intArg();
+    sessionId = intArg();
+    reason = intArg();
+
+    if (MG_ERROR_SCREEN == screen && ERROR_REASON == reason &&
+        SendAlertCommon(EPG_ERROR_POPUP_EVENT))
+    {
+        reportInt(sessionId);
+    }
+}
